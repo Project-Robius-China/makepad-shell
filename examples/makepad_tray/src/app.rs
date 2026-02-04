@@ -1,8 +1,10 @@
+#[cfg(any(target_os = "macos", target_os = "windows"))]
 use std::sync::Mutex;
 
 use makepad_widgets::*;
 use makepad_widgets::makepad_platform::CxOsOp;
 use makepad_widgets::makepad_platform::thread::SignalToUI;
+use makepad_widgets::makepad_platform::WindowId;
 use makepad_shell::{
     CommandId, Key, Modifiers, Shortcut, Tray, TrayCommandItem, TrayHandle, TrayIcon,
     TrayMenuItem, TrayMenuItemRole, TrayMenuModel, TrayModel,
@@ -12,8 +14,10 @@ const CMD_TOGGLE_GRID: u64 = 1;
 const CMD_CLOSE_TO_TRAY: u64 = 2;
 const CMD_QUIT: u64 = 3;
 
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "windows"))]
 static TRAY_COMMAND: Mutex<Option<CommandId>> = Mutex::new(None);
+#[cfg(any(target_os = "macos", target_os = "windows"))]
+static TRAY_ACTIVATE: Mutex<bool> = Mutex::new(false);
 
 live_design! {
     use link::theme::*;
@@ -23,6 +27,16 @@ live_design! {
         ui: <Root> {
             main_window = <Window> {
                 window: {title: "Makepad Tray Example"}
+                caption_bar = {
+                    windows_buttons = <View> {
+                        width: Fit,
+                        height: Fit,
+                        flow: Right,
+                        min = <DesktopButton> {draw_bg: {button_type: WindowsMin}}
+                        max = <DesktopButton> {draw_bg: {button_type: WindowsMax}}
+                        tray_close = <DesktopButton> {draw_bg: {button_type: WindowsClose}}
+                    }
+                }
                 body = <View> {
                     width: Fill,
                     height: Fill,
@@ -65,6 +79,8 @@ pub struct App {
     close_to_tray: bool,
     #[rust]
     tray_signal: SignalToUI,
+    #[rust]
+    window_id: Option<WindowId>,
 }
 
 impl LiveRegister for App {
@@ -75,7 +91,7 @@ impl LiveRegister for App {
 
 impl App {
     fn install_tray(&mut self) {
-        #[cfg(target_os = "macos")]
+        #[cfg(any(target_os = "macos", target_os = "windows"))]
         {
             if self.tray.is_some() {
                 return;
@@ -84,7 +100,8 @@ impl App {
             let icon = tray_icon(self.show_grid);
             let menu = build_tray_menu(self.show_grid, self.close_to_tray);
             let model = TrayModel::new(icon, menu).with_tooltip("Makepad Shell Tray");
-            let signal = self.tray_signal.clone();
+            let menu_signal = self.tray_signal.clone();
+            let activate_signal = self.tray_signal.clone();
 
             let result = Tray::create(
                 model,
@@ -94,11 +111,15 @@ impl App {
                     if let Ok(mut slot) = TRAY_COMMAND.lock() {
                         *slot = Some(cmd);
                     }
-                    signal.set();
+                    menu_signal.set();
                 },
-                || {
+                move || {
                     log!("tray activate");
                     eprintln!("tray activate");
+                    if let Ok(mut slot) = TRAY_ACTIVATE.lock() {
+                        *slot = true;
+                    }
+                    activate_signal.set();
                 },
             );
 
@@ -113,14 +134,50 @@ impl App {
     }
 
     fn drain_tray_events(&mut self, cx: &mut Cx) {
-        #[cfg(target_os = "macos")]
+        #[cfg(any(target_os = "macos", target_os = "windows"))]
         {
             if let Ok(mut slot) = TRAY_COMMAND.lock() {
                 if let Some(cmd) = slot.take() {
                     self.apply_command(cx, cmd);
                 }
             }
+            if let Ok(mut slot) = TRAY_ACTIVATE.lock() {
+                if *slot {
+                    *slot = false;
+                    self.handle_tray_activate(cx);
+                }
+            }
 
+        }
+    }
+
+    fn handle_tray_activate(&mut self, cx: &mut Cx) {
+        let Some(window_id) = self.window_id else {
+            return;
+        };
+        cx.push_unique_platform_op(CxOsOp::RestoreWindow(window_id));
+        #[cfg(target_os = "windows")]
+        {
+            cx.push_unique_platform_op(CxOsOp::SetTopmost(window_id, true));
+            cx.push_unique_platform_op(CxOsOp::SetTopmost(window_id, false));
+        }
+    }
+
+    fn handle_tray_close_button(&mut self, cx: &mut Cx) {
+        let Some(window_id) = self.window_id else {
+            return;
+        };
+        if self.close_to_tray {
+            #[cfg(target_os = "windows")]
+            {
+                cx.push_unique_platform_op(CxOsOp::MinimizeWindow(window_id));
+            }
+            #[cfg(not(target_os = "windows"))]
+            {
+                cx.push_unique_platform_op(CxOsOp::HideWindow(window_id));
+            }
+        } else {
+            cx.quit();
         }
     }
 
@@ -177,10 +234,35 @@ impl MatchEvent for App {
 impl AppMain for App {
     fn handle_event(&mut self, cx: &mut Cx, event: &Event) {
         self.match_event(cx, event);
+        if let Event::WindowGeomChange(ev) = event {
+            self.window_id = Some(ev.window_id);
+        }
+        if let Event::WindowGotFocus(window_id) = event {
+            self.window_id = Some(*window_id);
+        }
         if let Event::WindowCloseRequested(ev) = event {
+            self.window_id = Some(ev.window_id);
             if self.close_to_tray {
                 ev.accept_close.set(false);
-                cx.push_unique_platform_op(CxOsOp::HideWindow(ev.window_id));
+                #[cfg(target_os = "windows")]
+                {
+                    cx.push_unique_platform_op(CxOsOp::MinimizeWindow(ev.window_id));
+                }
+                #[cfg(not(target_os = "windows"))]
+                {
+                    cx.push_unique_platform_op(CxOsOp::HideWindow(ev.window_id));
+                }
+            }
+        }
+        if let Event::Actions(actions) = event {
+            let close_uid = self
+                .ui
+                .widget(ids!(main_window.caption_bar.windows_buttons.tray_close))
+                .widget_uid();
+            if close_uid.0 != 0 {
+                if let ButtonAction::Clicked(_) = actions.find_widget_action(close_uid).cast_ref() {
+                    self.handle_tray_close_button(cx);
+                }
             }
         }
         self.install_tray();

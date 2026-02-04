@@ -13,3 +13,13 @@ objc2-foundation = { workspace = true }
 objc2-app-kit    = { workspace = true }
 
 [dev-dependencies]
+
+[target.'cfg(target_os = "windows")'.dependencies]
+windows-sys = { version = "0.61.2", features = [
+    "Win32_Foundation",
+    "Win32_Graphics_Gdi",
+    "Win32_System_LibraryLoader",
+    "Win32_UI_Shell",
+    "Win32_UI_WindowsAndMessaging",
+] }
+png = "0.17.16"
